@@ -1,0 +1,23 @@
+# Jules Rules
+
+This file defines the coding standards and preferences for the Algai project.
+
+## Project Structure
+- `backend/`: Python code (Django/Flask or scripts).
+- `frontend/`: (If applicable) Web frontend.
+- `venv_gpu/`: Local virtual environment.
+
+## Coding Style
+- **Python**: Follow PEP 8. Use snake_case for functions/variables, PascalCase for classes.
+- **Docstrings**: Include docstrings for all major functions and classes.
+- **Type Hinting**: Use Python type hints where helpful.
+
+## Workflow
+- **Master Branch**: `main`
+- **PR Process**: All changes via Pull Requests.
+- **Testing**: Run tests before submitting PRs.
+
+## Tech Stack
+- Django
+- Pandas/NumPy
+- ML dependencies (PyTorch/TensorFlow as configured)

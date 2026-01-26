@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+venv/
+venv_gpu/
+.env
+
+# IntelliJ/PyCharm
+.idea/
+
+# Testing
+.pytest_cache/
+*.log
+coverage.xml
+htmlcov/
+
+# Large Data
+Data/
+backend/data_cache/
+backend/data_cache_alpaca/
+backend/models/*.pth
+backend/models/*.pkl
+backend/models/*.json
+backend/models/*.pt
+backend/models/*.safetensors
+backend/models/chronos_physics_lora/
+
+# Sensitive
+creds.txt
