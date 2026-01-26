@@ -1,0 +1,36 @@
+.dashboard-container {
+  padding: 20px;
+  background-color: #f4f4f9;
+  min-height: 100vh;
+}
+
+.glass-box-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 20px;
+  margin-top: 20px;
+}
+
+.column {
+  background: white;
+  padding: 15px;
+  border-radius: 8px;
+  box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+}
+
+.card {
+  border: 1px solid #eee;
+  padding: 10px;
+  margin-bottom: 10px;
+  border-radius: 5px;
+  background: #fff;
+}
+
+.placeholder-heatmap {
+  height: 150px;
+  background: linear-gradient(45deg, #eee, #ddd);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #666;
+}
