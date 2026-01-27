@@ -209,7 +209,7 @@ def train_chronos_phase2():
             "attention_mask": attention_mask
         }
 
-    trainer = CustomTrainer(
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=ds,
@@ -217,7 +217,17 @@ def train_chronos_phase2():
     )
     
     print("Starting Training...")
-    trainer.train()
+    
+    # Check for existing checkpoints to resume
+    last_checkpoint = None
+    if os.path.isdir(OUTPUT_DIR):
+        checkpoints = [d for d in os.listdir(OUTPUT_DIR) if d.startswith("checkpoint-")]
+        if checkpoints:
+            checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
+            print(f"Resuming from checkpoint: {checkpoints[-1]}")
+            last_checkpoint = True
+            
+    trainer.train(resume_from_checkpoint=last_checkpoint)
     
     model.save_pretrained(OUTPUT_DIR)
     print(f"Model saved to {OUTPUT_DIR}")

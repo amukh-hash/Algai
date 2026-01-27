@@ -3,132 +3,217 @@ import sys
 import torch
 import numpy as np
 import pandas as pd
-from torch.utils.data import DataLoader, Subset
-from sklearn.model_selection import KFold
 from tqdm import tqdm
+from chronos import ChronosPipeline
 
 # Add backend to path
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from app.models.patchtst import HybridPatchTST
-from app.core.trainer import Trainer
-from app.core.loss import UniversalLoss
-from scripts.train_universal import UniversalDataset
+# Constants
+DATA_PATH = "backend/data/processed/orthogonal_features_final.parquet"
+OUTPUT_PATH = "backend/data/judge_training_data.csv"
+BASE_MODEL_ID = "amazon/chronos-t5-large"
+CHECKPOINT_DIR = "backend/models/chronos_physics_phase2"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-def generate_metalabeling_data(tickers, k_folds=5, epochs_per_fold=3):
-    print(f"--- Generating Judge Data for {len(tickers)} tickers ({k_folds}-Fold CV) ---")
+def get_best_model_path():
+    if os.path.exists(CHECKPOINT_DIR):
+        checkpoints = [d for d in os.listdir(CHECKPOINT_DIR) if d.startswith("checkpoint-")]
+        if checkpoints:
+            checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
+            latest = os.path.join(CHECKPOINT_DIR, checkpoints[-1])
+            print(f"Found local checkpoint: {latest}")
+            return latest
+    return BASE_MODEL_ID
+
+def generate_data():
+    model_path = get_best_model_path()
+    print(f"--- Generating Judge Data using {model_path} on {DEVICE} ---")
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if not os.path.exists(DATA_PATH):
+        print(f"Error: Data not found at {DATA_PATH}")
+        return
+
+    print("Loading Data...")
+    df = pd.read_parquet(DATA_PATH)
+    print(f"Columns: {df.columns.tolist()}")
+
+    # Fix Column Access
+    price_col = 'microprice' if 'microprice' in df.columns else 'close'
+    if price_col not in df.columns:
+        print(f"CRITICAL: Could not find price column (checked 'microprice', 'close').")
+        return
+    print(f"Using Price Column: {price_col}")
+
+    if 'ticker' not in df.columns:
+        print("Warning: No 'ticker' column. Treating as single sequence.")
+        tickers = ['UNKNOWN']
+        df['ticker'] = 'UNKNOWN'
+    else:
+        tickers = df['ticker'].unique()
+        
+    print(f"Loading Chronos Base: {BASE_MODEL_ID}...")
     
-    # Global collection
+    # 1. Load Full Pipeline (Standard)
+    # This gives us the correct wrapper structure (ChronosModel)
+    pipeline = ChronosPipeline.from_pretrained(
+        BASE_MODEL_ID,
+        device_map=DEVICE,
+        torch_dtype=torch.float32
+    )
+
+    # 2. Inject LoRA Adapters
+    if model_path != BASE_MODEL_ID:
+        print(f"Loading LoRA adapters from {model_path}...")
+        from peft import PeftModel
+        try:
+            # Inspection: ChronosPipeline.model is likely the ChronosModel wrapper
+            # ChronosModel.model is the HuggingFace T5 model (based on error logs)
+            
+            # Target the HF model inside the wrapper
+            # valid hierarchy: pipeline -> .model (ChronosModel) -> .model (T5ForConditionalGeneration)
+            
+            t5_model = pipeline.model.model 
+            
+            # Apply LoRA
+            peft_model = PeftModel.from_pretrained(t5_model, model_path)
+            merged_model = peft_model.merge_and_unload()
+            
+            # Inject back
+            pipeline.model.model = merged_model
+            
+            print("LoRA Adapters merged and injected successfully.")
+        except Exception as e:
+            print(f"WARNING: LoRA Injection Failed: {e}")
+            print("Debug: valid attrs of pipeline.model:", dir(pipeline.model))
+            print(" proceeding with Base Model.")
+
     all_rows = []
+    
+    # Parameters
+    context_len = 512
+    pred_len = 64
+    stride = 1024 # Sparse Sampling (was 64) - Reduces data by 16x
+    BATCH_SIZE = 8 # Safe batch size
+    NUM_SAMPLES = 5 # Reduce paths (was 10) - Reduces compute by 2x
+    
+    # Import TBM
+    from app.targets.triple_barrier import get_daily_vol, apply_triple_barrier
+
+    # Check for existing data to resume
+    if os.path.exists(OUTPUT_PATH):
+        print(f"Resuming: Found existing data at {OUTPUT_PATH}")
+        existing_df = pd.read_csv(OUTPUT_PATH)
+        processed_count = len(existing_df)
+    else:
+        processed_count = 0
+        with open(OUTPUT_PATH, 'w') as f:
+            f.write("ticker,true_label,true_ret,pred_label,conf_score,prob_buy,prob_sell,prob_neutral,rsi,volatility_proxy,bpi,ad_line,fold\n")
+
+    total_rows_generated = processed_count
     
     for ticker in tickers:
         print(f"Processing {ticker}...")
-        ds = UniversalDataset(tickers=[ticker], lookback=64)
-        if len(ds) < 500:
-            print(f"Skipping {ticker} (Too small: {len(ds)})")
+        sub_df = df[df['ticker'] == ticker].copy()
+        
+        # Prices as Series for TBM
+        prices_series = sub_df[price_col]
+        prices = prices_series.values
+        
+        # 1. Compute Volatility & Triple Barrier Labels
+        # We do this upfront for the whole series = Fast
+        print(f"  Calculating Triple Barriers...")
+        vol = get_daily_vol(prices_series, span=100)
+        events = apply_triple_barrier(
+            prices_series, 
+            vol, 
+            vertical_barrier_steps=pred_len, # 64
+            barrier_width_multiplier=2.0 
+        )
+        # events columns: label, trade_end_idx, ret
+        # aligned with df index
+        
+        n = len(prices)
+        if n < context_len + pred_len:
             continue
             
-        # K-Fold Split
-        # We assume samples are independent enough due to purging.
-        kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
-        
-        indices = np.arange(len(ds))
-        
-        for fold_idx, (train_idx, val_idx) in enumerate(kf.split(indices)):
-            # 1. Train Specialist on Train Fold
-            # For speed, we initialize from Pretrained Physics if available (Transfer Learning)
-            # OR random init if we want pure specialist test. 
-            # Plan says: "Train Specialist... Pred on Val".
-            # So we load Universal, Fine-tune on Train, Pred on Val.
+        # Collect Valid Indices
+        valid_indices = []
+        for i in range(context_len, n - pred_len, stride):
+            idx_entry = i - 1
+            if idx_entry < len(events):
+                valid_indices.append(i)
+
+        # Batch Processing
+        for batch_start in tqdm(range(0, len(valid_indices), BATCH_SIZE), desc=f"{ticker}"):
+            batch_idxs = valid_indices[batch_start : batch_start + BATCH_SIZE]
             
-            model = HybridPatchTST(num_input_features=10, lookback_window=64, n_heads=8, d_model=128, n_classes=3)
-            univ_path = "backend/models/pretrained_market_physics.pt"
-            if os.path.exists(univ_path):
-                model.load_state_dict(torch.load(univ_path, map_location=device), strict=False)
-            model.to(device)
+            # Prepare Batch Input
+            contexts = []
+            for i in batch_idxs:
+                # Context Window
+                ctx = prices[i-context_len : i]
+                contexts.append(torch.tensor(ctx, dtype=torch.float32))
             
-            # Freeze extraction layers for speed/stability
-            for p in model.patch_embedding.parameters(): p.requires_grad = False
-            for p in model.backbone.encoder.layers[:2].parameters(): p.requires_grad = False
+            if not contexts: continue
             
-            train_loader = DataLoader(Subset(ds, train_idx), batch_size=256, shuffle=True)
-            # Validation Loader (to predict)
-            val_loader = DataLoader(Subset(ds, val_idx), batch_size=256, shuffle=False)
+            # Chronos Inference (Batched)
+            try:
+                # List of tensors
+                forecasts = pipeline.predict(
+                    contexts,
+                    prediction_length=pred_len,
+                    num_samples=NUM_SAMPLES
+                ) # (B, num_samples, pred_len)
+            except Exception as e:
+                print(f"Batch Error: {e}")
+                continue
+                
+            # Process Batch Results
+            batch_rows = []
+            for b, i in enumerate(batch_idxs):
+                idx_entry = i - 1
+                row_label = events['label'].iloc[idx_entry]
+                row_ret = events['ret'].iloc[idx_entry]
+                true_label = int(row_label)
+                ctx_row = sub_df.iloc[i-1]
+                
+                # Forecast Analysis
+                forecast = forecasts[b] # (num_samples, pred_len)
+                
+                # Median path return
+                median_path = torch.median(forecast, dim=0).values.numpy() # dim=0 across samples
+                pred_return = (median_path[-1] - prices[i-1]) / prices[i-1]
+                
+                # Quantiles
+                low_path = torch.quantile(forecast, 0.1, dim=0).numpy()
+                high_path = torch.quantile(forecast, 0.9, dim=0).numpy()
+                spread = np.mean(high_path - low_path)
+                 
+                # Pred Label
+                thresh = 0.001
+                if pred_return > thresh: pred_label = 1
+                elif pred_return < -thresh: pred_label = 2
+                else: pred_label = 0
+                
+                # Probabilities
+                paths = forecast.numpy() # (num_samples, 64)
+                final_rets = (paths[:, -1] - prices[i-1]) / prices[i-1]
+                prob_buy = np.mean(final_rets > thresh)
+                prob_sell = np.mean(final_rets < -thresh)
+                prob_neutral = 1.0 - prob_buy - prob_sell
+                
+                row_str = f"{ticker},{true_label},{row_ret:.6f},{pred_label},{1.0 - (spread / prices[i-1]):.4f},{prob_buy:.2f},{prob_sell:.2f},{prob_neutral:.2f},{ctx_row.get('rsi', 50)},{ctx_row.get('volatility_proxy', 0)},{ctx_row.get('bpi', 50)},{ctx_row.get('ad_line', 0)},0\n"
+                batch_rows.append(row_str)
             
-            criterion = UniversalLoss(num_classes=3)
-            optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
+            # Incremental Save
+            with open(OUTPUT_PATH, 'a') as f:
+                for r in batch_rows:
+                    f.write(r)
             
-            # Short Training
-            # No trainer? Use manual loop for tight control or Trainer.
-            # Trainer is fine.
-            trainer = Trainer(model, criterion, optimizer, device=device, verbose=False)
-            trainer.fit(train_loader, None, epochs=epochs_per_fold, patience=1)
-            
-            # 2. Predict on Val Fold
-            model.eval()
-            with torch.no_grad():
-                for inputs, targets in val_loader:
-                    inputs = inputs.to(device)
-                    # targets: (label, vol)
-                    true_labels = targets[:, 0].numpy()
-                    
-                    # Forward
-                    logits, pred_vol = model(inputs)
-                    
-                    # Probabilities
-                    probs = torch.softmax(logits, dim=1).cpu().numpy() # (B, 3)
-                    conf = np.max(probs, axis=1)
-                    pred_class = np.argmax(probs, axis=1)
-                    
-                    # Extract Context Features (BPI, Breadth, VIX/RS?)
-                    # Inputs structure: [OHLCV, BPI, AD, RS, RSI, SMA]
-                    # indices: 0..4, 5=BPI, 6=AD, 7=RS, 8-9...
-                    # We take the LAST time step of the input window for context?
-                    # shape: (B, Lookback, Feats)
-                    last_step = inputs[:, -1, :].cpu().numpy()
-                    bpi = last_step[:, 5]
-                    ad_line = last_step[:, 6]
-                    rs = last_step[:, 7]
-                    rsi_val = last_step[:, 8]
-                    
-                    for i in range(len(true_labels)):
-                        row = {
-                            'ticker': ticker,
-                            'fold': fold_idx,
-                            'true_label': true_labels[i],
-                            'pred_label': pred_class[i],
-                            'conf_sell': probs[i, 0], # label 0 = Sell? No 0=Neutral? 
-                            # Triple Barrier: 0=Neutral, 1=Buy, 2=Sell (mapped via PyTorch indexing?)
-                            # Wait, apply_triple_barrier returns 0, 1, 2. 
-                            # 0=Neutral, 1=Buy, 2=Sell.
-                            # So Class 0: Neutral, Class 1: Buy, Class 2: Sell.
-                            
-                            'prob_neutral': probs[i, 0],
-                            'prob_buy': probs[i, 1],
-                            'prob_sell': probs[i, 2],
-                            
-                            'bpi': bpi[i],
-                            'ad_line': ad_line[i],
-                            'rs': rs[i],
-                            'rsi': rsi_val[i]
-                        }
-                        all_rows.append(row)
-            
-        # Clean up per ticker
-        del ds
-        torch.cuda.empty_cache()
-        
-    # Save
-    df = pd.DataFrame(all_rows)
-    out_path = "backend/data/judge_training_data.csv"
-    df.to_csv(out_path, index=False)
-    print(f"Judge Data Generated: {len(df)} rows. Saved to {out_path}")
+            total_rows_generated += len(batch_rows)
+
+    print(f"Finished. Total rows: {total_rows_generated}")
 
 if __name__ == "__main__":
-    # Representative subset for the Judge
-    # Ideally all 100, but takes time.
-    # Let's pick Top 5 Liquid + Top 5 Vol
-    targets = ["NVDA", "TSLA", "AMD", "COIN", "MSTR", "SPY", "QQQ", "AAPL", "MSFT", "IWM"]
-    generate_metalabeling_data(targets, k_folds=3, epochs_per_fold=1) # Fast run for testing
+    generate_data()

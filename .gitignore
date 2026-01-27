@@ -27,6 +27,10 @@ backend/models/*.json
 backend/models/*.pt
 backend/models/*.safetensors
 backend/models/chronos_physics_lora/
+backend/models/chronos_physics_phase2/
+backend/data/processed/
+backend/data/*.csv
+backend/data/*.parquet
 
 # Sensitive
 creds.txt
