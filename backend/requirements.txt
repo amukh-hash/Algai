@@ -10,3 +10,11 @@ httpx
 requests
 pyarrow
 tqdm
+chronos-forecasting>=2.0
+PyWavelets
+filterpy
+numba
+torchsort
+riskfolio-lib
+databento
+xgboost
