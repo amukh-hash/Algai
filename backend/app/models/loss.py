@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchsort
 
 class StudentTradingLoss(nn.Module):
     def __init__(self, tokenizer_centers, risk_free_rate=0.0, focal_gamma=2.0):
